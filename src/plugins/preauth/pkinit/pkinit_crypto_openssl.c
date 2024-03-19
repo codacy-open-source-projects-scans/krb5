@@ -73,10 +73,9 @@ typedef struct _pkinit_cred_info *pkinit_cred_info;
 
 struct _pkinit_identity_crypto_context {
     pkinit_cred_info creds[MAX_CREDS_ALLOWED+1];
-    STACK_OF(X509) *my_certs;   /* available user certs */
+    X509 *my_cert;              /* selected user or KDC cert */
     char *identity;             /* identity name for user cert */
-    int cert_index;             /* cert to use out of available certs*/
-    EVP_PKEY *my_key;           /* available user keys if in filesystem */
+    EVP_PKEY *my_key;           /* selected cert key if in filesystem */
     STACK_OF(X509) *trustedCAs; /* available trusted ca certs */
     STACK_OF(X509) *intermediateCAs;   /* available intermediate ca certs */
     STACK_OF(X509_CRL) *revoked;    /* available crls */
@@ -94,7 +93,6 @@ struct _pkinit_identity_crypto_context {
     CK_FUNCTION_LIST_PTR p11;
     uint8_t *cert_id;
     size_t cert_id_len;
-    CK_MECHANISM_TYPE mech;
 #endif
     krb5_boolean defer_id_prompt;
     pkinit_deferred_id *deferred_ids;
@@ -163,9 +161,11 @@ static krb5_error_code pkinit_create_sequence_of_principal_identifiers
  int type, krb5_pa_data ***e_data_out);
 
 #ifndef WITHOUT_PKCS11
-static krb5_error_code pkinit_find_private_key
-(pkinit_identity_crypto_context, CK_ATTRIBUTE_TYPE usage,
- CK_OBJECT_HANDLE *objp);
+static krb5_error_code
+pkinit_find_private_key(krb5_context context,
+                        pkinit_identity_crypto_context id_cryptoctx,
+                        CK_ATTRIBUTE_TYPE usage,
+                        CK_OBJECT_HANDLE *objp);
 static krb5_error_code pkinit_login
 (krb5_context context, pkinit_identity_crypto_context id_cryptoctx,
  CK_TOKEN_INFO *tip, const char *password);
@@ -182,6 +182,8 @@ static krb5_error_code pkinit_sign_data_pkcs11
 (krb5_context context, pkinit_identity_crypto_context id_cryptoctx,
  unsigned char *data, unsigned int data_len,
  unsigned char **sig, unsigned int *sig_len);
+
+static krb5_error_code p11err(krb5_context context, CK_RV rv, const char *op);
 #endif  /* WITHOUT_PKCS11 */
 
 static krb5_error_code pkinit_sign_data_fs
@@ -199,9 +201,6 @@ create_krb5_invalidCertificates(krb5_context context,
 static krb5_error_code
 create_identifiers_from_stack(STACK_OF(X509) *sk,
                               krb5_external_principal_identifier *** ids);
-static const char *
-pkcs11err(int err);
-
 
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
 
@@ -284,7 +283,6 @@ compat_get0_EC(const EVP_PKEY *pkey)
 #if OPENSSL_VERSION_NUMBER < 0x30000000L
 /* OpenSSL 3.0 changes several preferred function names. */
 #define EVP_PKEY_parameters_eq EVP_PKEY_cmp_parameters
-#define EVP_MD_CTX_get0_md EVP_MD_CTX_md
 #define EVP_PKEY_get_size EVP_PKEY_size
 #define EVP_PKEY_get_bits EVP_PKEY_bits
 
@@ -947,8 +945,9 @@ cleanup:
 
 #endif /* OPENSSL_VERSION_NUMBER < 0x30000000L */
 
+#ifndef WITHOUT_PKC11
 static struct pkcs11_errstrings {
-    short code;
+    CK_RV code;
     char *text;
 } pkcs11_errstrings[] = {
     { 0x0,      "ok" },
@@ -1038,6 +1037,7 @@ static struct pkcs11_errstrings {
     { 0x200,    "function rejected" },
     { -1,       NULL }
 };
+#endif
 
 MAKE_INIT_FUNCTION(pkinit_openssl_init);
 
@@ -1489,8 +1489,7 @@ pkinit_init_certs(pkinit_identity_crypto_context ctx)
 
     for (i = 0; i < MAX_CREDS_ALLOWED; i++)
         ctx->creds[i] = NULL;
-    ctx->my_certs = NULL;
-    ctx->cert_index = 0;
+    ctx->my_cert = NULL;
     ctx->my_key = NULL;
     ctx->trustedCAs = NULL;
     ctx->intermediateCAs = NULL;
@@ -1506,8 +1505,8 @@ pkinit_fini_certs(pkinit_identity_crypto_context ctx)
     if (ctx == NULL)
         return;
 
-    if (ctx->my_certs != NULL)
-        sk_X509_pop_free(ctx->my_certs, X509_free);
+    if (ctx->my_cert != NULL)
+        X509_free(ctx->my_cert);
 
     if (ctx->my_key != NULL)
         EVP_PKEY_free(ctx->my_key);
@@ -1567,6 +1566,8 @@ pkinit_fini_pkcs11(pkinit_identity_crypto_context ctx)
     free(ctx->token_label);
     free(ctx->cert_id);
     free(ctx->cert_label);
+    ctx->p11_module_name = ctx->token_label = ctx->cert_label = NULL;
+    ctx->cert_id = NULL;
 #endif
 }
 
@@ -1664,7 +1665,22 @@ cleanup:
     return retval;
 }
 
+/* Return the name ID of the signature algorithm for cert, assuming that the
+ * digest used is SHA-256 and the cert uses either an RSA or EC public key. */
+static int
+cert_sig_alg(X509 *cert)
+{
+    /* Use X509_get0_pubkey() when OpenSSL 1.0 support is removed. */
+    EVP_PKEY *pkey = X509_get_pubkey(cert);
+    int id;
 
+    if (pkey != NULL && EVP_PKEY_get_base_id(pkey) == EVP_PKEY_EC)
+        id = NID_ecdsa_with_SHA256;
+    else
+        id = NID_sha256WithRSAEncryption;
+    EVP_PKEY_free(pkey);
+    return id;
+}
 
 krb5_error_code
 cms_signeddata_create(krb5_context context,
@@ -1685,19 +1701,14 @@ cms_signeddata_create(krb5_context context,
     STACK_OF(X509) * cert_stack = NULL;
     ASN1_OCTET_STRING *digest_attr = NULL;
     EVP_MD_CTX *ctx;
-    const EVP_MD *md_tmp = NULL;
-    unsigned char md_data[EVP_MAX_MD_SIZE], md_data2[EVP_MAX_MD_SIZE];
-    unsigned char *digestInfo_buf = NULL, *abuf = NULL;
-    unsigned int md_len, md_len2, alen, digestInfo_len;
+    unsigned char md_data[EVP_MAX_MD_SIZE], *abuf = NULL;
+    unsigned int md_len, alen;
     STACK_OF(X509_ATTRIBUTE) * sk;
     unsigned char *sig = NULL;
     unsigned int sig_len = 0;
     X509_ALGOR *alg = NULL;
-    ASN1_OCTET_STRING *digest = NULL;
-    unsigned int alg_len = 0, digest_len = 0;
-    unsigned char *y = NULL;
-    X509 *cert = NULL;
     ASN1_OBJECT *oid = NULL, *oid_copy;
+    int sig_alg_id;
 
     /* Start creating PKCS7 data. */
     if ((p7 = PKCS7_new()) == NULL)
@@ -1715,7 +1726,7 @@ cms_signeddata_create(krb5_context context,
     if (oid == NULL)
         goto cleanup;
 
-    if (id_cryptoctx->my_certs != NULL) {
+    if (id_cryptoctx->my_cert != NULL) {
         X509_STORE *certstore = NULL;
         X509_STORE_CTX *certctx;
         STACK_OF(X509) *certstack = NULL;
@@ -1726,8 +1737,6 @@ cms_signeddata_create(krb5_context context,
         if ((cert_stack = sk_X509_new_null()) == NULL)
             goto cleanup;
 
-        cert = sk_X509_value(id_cryptoctx->my_certs, id_cryptoctx->cert_index);
-
         certstore = X509_STORE_new();
         if (certstore == NULL)
             goto cleanup;
@@ -1736,7 +1745,7 @@ cms_signeddata_create(krb5_context context,
         certctx = X509_STORE_CTX_new();
         if (certctx == NULL)
             goto cleanup;
-        X509_STORE_CTX_init(certctx, certstore, cert,
+        X509_STORE_CTX_init(certctx, certstore, id_cryptoctx->my_cert,
                             id_cryptoctx->intermediateCAs);
         X509_STORE_CTX_trusted_stack(certctx, id_cryptoctx->trustedCAs);
         if (!X509_verify_cert(certctx)) {
@@ -1764,13 +1773,13 @@ cms_signeddata_create(krb5_context context,
         if (!ASN1_INTEGER_set(p7si->version, 1))
             goto cleanup;
         if (!X509_NAME_set(&p7si->issuer_and_serial->issuer,
-                           X509_get_issuer_name(cert)))
+                           X509_get_issuer_name(id_cryptoctx->my_cert)))
             goto cleanup;
         /* because ASN1_INTEGER_set is used to set a 'long' we will do
          * things the ugly way. */
         ASN1_INTEGER_free(p7si->issuer_and_serial->serial);
         if (!(p7si->issuer_and_serial->serial =
-              ASN1_INTEGER_dup(X509_get_serialNumber(cert))))
+              ASN1_INTEGER_dup(X509_get_serialNumber(id_cryptoctx->my_cert))))
             goto cleanup;
 
         /* will not fill-out EVP_PKEY because it's on the smartcard */
@@ -1787,8 +1796,8 @@ cms_signeddata_create(krb5_context context,
         /* Set sig algs */
         if (p7si->digest_enc_alg->parameter != NULL)
             ASN1_TYPE_free(p7si->digest_enc_alg->parameter);
-        p7si->digest_enc_alg->algorithm =
-            OBJ_nid2obj(NID_sha256WithRSAEncryption);
+        sig_alg_id = cert_sig_alg(id_cryptoctx->my_cert);
+        p7si->digest_enc_alg->algorithm = OBJ_nid2obj(sig_alg_id);
         if (!(p7si->digest_enc_alg->parameter = ASN1_TYPE_new()))
             goto cleanup;
         p7si->digest_enc_alg->parameter->type = V_ASN1_NULL;
@@ -1800,7 +1809,6 @@ cms_signeddata_create(krb5_context context,
             goto cleanup;
         EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
         EVP_DigestUpdate(ctx, data, data_len);
-        md_tmp = EVP_MD_CTX_get0_md(ctx);
         EVP_DigestFinal_ex(ctx, md_data, &md_len);
         EVP_MD_CTX_free(ctx);
 
@@ -1825,63 +1833,8 @@ cms_signeddata_create(krb5_context context,
         if (abuf == NULL)
             goto cleanup2;
 
-#ifndef WITHOUT_PKCS11
-        /*
-         * Some tokens can only do RSAEncryption without a hash.  To compute
-         * sha256WithRSAEncryption, encode the algorithm ID for the hash
-         * function and the hash value into an ASN.1 value of type DigestInfo:
-         * DigestInfo ::= SEQUENCE {
-         *   digestAlgorithm  AlgorithmIdentifier,
-         *   digest  OCTET STRING
-         * }
-         */
-        if (id_cryptoctx->pkcs11_method == 1 &&
-            id_cryptoctx->mech == CKM_RSA_PKCS) {
-            pkiDebug("mech = CKM_RSA_PKCS\n");
-            ctx = EVP_MD_CTX_new();
-            if (ctx == NULL)
-                goto cleanup;
-            EVP_DigestInit_ex(ctx, md_tmp, NULL);
-            EVP_DigestUpdate(ctx, abuf, alen);
-            EVP_DigestFinal_ex(ctx, md_data2, &md_len2);
-            EVP_MD_CTX_free(ctx);
-
-            alg = X509_ALGOR_new();
-            if (alg == NULL)
-                goto cleanup2;
-            X509_ALGOR_set0(alg, OBJ_nid2obj(NID_sha256), V_ASN1_NULL, NULL);
-            alg_len = i2d_X509_ALGOR(alg, NULL);
-
-            digest = ASN1_OCTET_STRING_new();
-            if (digest == NULL)
-                goto cleanup2;
-            ASN1_OCTET_STRING_set(digest, md_data2, (int)md_len2);
-            digest_len = i2d_ASN1_OCTET_STRING(digest, NULL);
-
-            digestInfo_len = ASN1_object_size(1, (int)(alg_len + digest_len),
-                                              V_ASN1_SEQUENCE);
-            y = digestInfo_buf = malloc(digestInfo_len);
-            if (digestInfo_buf == NULL)
-                goto cleanup2;
-            ASN1_put_object(&y, 1, (int)(alg_len + digest_len), V_ASN1_SEQUENCE,
-                            V_ASN1_UNIVERSAL);
-            i2d_X509_ALGOR(alg, &y);
-            i2d_ASN1_OCTET_STRING(digest, &y);
-#ifdef DEBUG_SIG
-            pkiDebug("signing buffer\n");
-            print_buffer(digestInfo_buf, digestInfo_len);
-            print_buffer_bin(digestInfo_buf, digestInfo_len, "/tmp/pkcs7_tosign");
-#endif
-            retval = pkinit_sign_data(context, id_cryptoctx, digestInfo_buf,
-                                      digestInfo_len, &sig, &sig_len);
-        } else
-#endif
-        {
-            pkiDebug("mech = %s\n",
-                     id_cryptoctx->pkcs11_method == 1 ? "CKM_SHA256_RSA_PKCS" : "FS");
-            retval = pkinit_sign_data(context, id_cryptoctx, abuf, alen,
-                                      &sig, &sig_len);
-        }
+        retval = pkinit_sign_data(context, id_cryptoctx, abuf, alen,
+                                  &sig, &sig_len);
 #ifdef DEBUG_SIG
         print_buffer(sig, sig_len);
 #endif
@@ -1935,14 +1888,6 @@ cms_signeddata_create(krb5_context context,
 
 cleanup2:
     if (p7si) {
-#ifndef WITHOUT_PKCS11
-        if (id_cryptoctx->pkcs11_method == 1 &&
-            id_cryptoctx->mech == CKM_RSA_PKCS) {
-            free(digestInfo_buf);
-            if (digest != NULL)
-                ASN1_OCTET_STRING_free(digest);
-        }
-#endif
         if (alg != NULL)
             X509_ALGOR_free(alg);
     }
@@ -3311,7 +3256,7 @@ pkinit_check_kdc_pkid(krb5_context context,
     PKCS7_ISSUER_AND_SERIAL *is = NULL;
     const unsigned char *p = pdid_buf;
     int status = 1;
-    X509 *kdc_cert = sk_X509_value(id_cryptoctx->my_certs, id_cryptoctx->cert_index);
+    X509 *kdc_cert = id_cryptoctx->my_cert;
 
     *valid_kdcPkId = 0;
     pkiDebug("found kdcPkId in AS REQ\n");
@@ -3420,48 +3365,53 @@ pkinit_pkcs7type2oid(pkinit_plg_crypto_context cryptoctx, int pkcs7_type)
 }
 
 #ifndef WITHOUT_PKCS11
-static struct plugin_file_handle *
+static krb5_error_code
 load_pkcs11_module(krb5_context context, const char *modname,
-                   CK_FUNCTION_LIST_PTR_PTR p11p)
+                   struct plugin_file_handle **handle_out,
+                   CK_FUNCTION_LIST_PTR_PTR p11_out)
 {
     struct plugin_file_handle *handle = NULL;
-    CK_RV (*getflist)(CK_FUNCTION_LIST_PTR_PTR);
+    CK_RV rv, (*getflist)(CK_FUNCTION_LIST_PTR_PTR);
     struct errinfo einfo = EMPTY_ERRINFO;
-    const char *errmsg = NULL;
+    const char *errmsg = NULL, *failure;
     void (*sym)(void);
     long err;
-    CK_RV rv;
 
     TRACE_PKINIT_PKCS11_OPEN(context, modname);
     err = krb5int_open_plugin(modname, &handle, &einfo);
     if (err) {
-        errmsg = k5_get_error(&einfo, err);
-        TRACE_PKINIT_PKCS11_OPEN_FAILED(context, errmsg);
+        failure = _("Cannot load PKCS11 module");
         goto error;
     }
 
     err = krb5int_get_plugin_func(handle, "C_GetFunctionList", &sym, &einfo);
     if (err) {
-        errmsg = k5_get_error(&einfo, err);
-        TRACE_PKINIT_PKCS11_GETSYM_FAILED(context, errmsg);
+        failure = _("Cannot find C_GetFunctionList in PKCS11 module");
         goto error;
     }
 
     getflist = (CK_RV (*)(CK_FUNCTION_LIST_PTR_PTR))sym;
-    rv = (*getflist)(p11p);
+    rv = (*getflist)(p11_out);
     if (rv != CKR_OK) {
-        TRACE_PKINIT_PKCS11_GETFLIST_FAILED(context, pkcs11err(rv));
+        failure = _("Cannot retrieve function list in PKCS11 module");
         goto error;
     }
 
-    return handle;
+    *handle_out = handle;
+    return 0;
 
 error:
-    k5_free_error(&einfo, errmsg);
+    if (err) {
+        errmsg = k5_get_error(&einfo, err);
+        k5_setmsg(context, err, _("%s: %s"), failure, errmsg);
+    } else {
+        err = KRB5KDC_ERR_PREAUTH_FAILED;
+        k5_setmsg(context, err, "%s", failure);
+    }
     k5_clear_error(&einfo);
     if (handle != NULL)
         krb5int_close_plugin(handle);
-    return NULL;
+    return err;
 }
 
 static krb5_error_code
@@ -3469,12 +3419,13 @@ pkinit_login(krb5_context context,
              pkinit_identity_crypto_context id_cryptoctx,
              CK_TOKEN_INFO *tip, const char *password)
 {
+    krb5_error_code ret = 0;
+    CK_RV rv;
     krb5_data rdat;
     char *prompt;
     const char *warning;
     krb5_prompt kprompt;
     krb5_prompt_type prompt_type;
-    int r = 0;
 
     if (tip->flags & CKF_PROTECTED_AUTHENTICATION_PATH) {
         rdat.data = NULL;
@@ -3483,7 +3434,7 @@ pkinit_login(krb5_context context,
         rdat.data = strdup(password);
         rdat.length = strlen(password);
     } else if (id_cryptoctx->prompter == NULL) {
-        r = KRB5_LIBOS_CANTREADPWD;
+        ret = KRB5_LIBOS_CANTREADPWD;
         rdat.data = NULL;
     } else {
         if (tip->flags & CKF_USER_PIN_LOCKED)
@@ -3507,31 +3458,28 @@ pkinit_login(krb5_context context,
 
         /* PROMPTER_INVOCATION */
         k5int_set_prompt_types(context, &prompt_type);
-        r = (*id_cryptoctx->prompter)(context, id_cryptoctx->prompter_data,
-                                      NULL, NULL, 1, &kprompt);
+        ret = (*id_cryptoctx->prompter)(context, id_cryptoctx->prompter_data,
+                                        NULL, NULL, 1, &kprompt);
         k5int_set_prompt_types(context, 0);
         free(prompt);
     }
 
-    if (r == 0) {
-        r = id_cryptoctx->p11->C_Login(id_cryptoctx->session, CKU_USER,
-                                       (u_char *) rdat.data, rdat.length);
-
-        if (r != CKR_OK) {
-            TRACE_PKINIT_PKCS11_LOGIN_FAILED(context, pkcs11err(r));
-            r = KRB5KDC_ERR_PREAUTH_FAILED;
-        }
+    if (!ret) {
+        rv = id_cryptoctx->p11->C_Login(id_cryptoctx->session, CKU_USER,
+                                        (uint8_t *)rdat.data, rdat.length);
+        if (rv != CKR_OK)
+            ret = p11err(context, rv, "C_Login");
     }
     free(rdat.data);
 
-    return r;
+    return ret;
 }
 
 static krb5_error_code
 pkinit_open_session(krb5_context context,
                     pkinit_identity_crypto_context cctx)
 {
-    CK_ULONG i, pret;
+    CK_ULONG i, rv;
     unsigned char *cp;
     size_t label_len;
     CK_ULONG count = 0;
@@ -3545,30 +3493,35 @@ pkinit_open_session(krb5_context context,
         return 0; /* session already open */
 
     /* Load module */
-    cctx->p11_module = load_pkcs11_module(context, cctx->p11_module_name,
-                                          &cctx->p11);
-    if (cctx->p11_module == NULL)
-        return KRB5KDC_ERR_PREAUTH_FAILED;
+    ret = load_pkcs11_module(context, cctx->p11_module_name, &cctx->p11_module,
+                             &cctx->p11);
+    if (ret)
+        goto cleanup;
 
     /* Init */
-    pret = cctx->p11->C_Initialize(NULL);
-    if (pret != CKR_OK) {
-        pkiDebug("C_Initialize: %s\n", pkcs11err(pret));
-        return KRB5KDC_ERR_PREAUTH_FAILED;
+    rv = cctx->p11->C_Initialize(NULL);
+    if (rv != CKR_OK) {
+        ret = p11err(context, rv, "C_Initialize");
+        goto cleanup;
     }
 
     /* Get the list of available slots */
-    if (cctx->p11->C_GetSlotList(TRUE, NULL, &count) != CKR_OK)
-        return KRB5KDC_ERR_PREAUTH_FAILED;
+    rv = cctx->p11->C_GetSlotList(TRUE, NULL, &count);
+    if (rv != CKR_OK) {
+        ret = p11err(context, rv, "C_GetSlotList");
+        goto cleanup;
+    }
     if (count == 0) {
         TRACE_PKINIT_PKCS11_NO_TOKEN(context);
-        return KRB5KDC_ERR_PREAUTH_FAILED;
-    }
-    slotlist = calloc(count, sizeof(CK_SLOT_ID));
-    if (slotlist == NULL)
-        return ENOMEM;
-    if (cctx->p11->C_GetSlotList(TRUE, slotlist, &count) != CKR_OK) {
         ret = KRB5KDC_ERR_PREAUTH_FAILED;
+        goto cleanup;
+    }
+    slotlist = k5calloc(count, sizeof(CK_SLOT_ID), &ret);
+    if (slotlist == NULL)
+        goto cleanup;
+    rv = cctx->p11->C_GetSlotList(TRUE, slotlist, &count);
+    if (rv != CKR_OK) {
+        ret = p11err(context, rv, "C_GetSlotList");
         goto cleanup;
     }
 
@@ -3579,19 +3532,17 @@ pkinit_open_session(krb5_context context,
             continue;
 
         /* Open session */
-        pret = cctx->p11->C_OpenSession(slotlist[i], CKF_SERIAL_SESSION,
-                                        NULL, NULL, &cctx->session);
-        if (pret != CKR_OK) {
-            pkiDebug("C_OpenSession: %s\n", pkcs11err(pret));
-            ret = KRB5KDC_ERR_PREAUTH_FAILED;
+        rv = cctx->p11->C_OpenSession(slotlist[i], CKF_SERIAL_SESSION,
+                                      NULL, NULL, &cctx->session);
+        if (rv != CKR_OK) {
+            ret = p11err(context, rv, "C_OpenSession");
             goto cleanup;
         }
 
         /* Get token info */
-        pret = cctx->p11->C_GetTokenInfo(slotlist[i], &tinfo);
-        if (pret != CKR_OK) {
-            pkiDebug("C_GetTokenInfo: %s\n", pkcs11err(pret));
-            ret = KRB5KDC_ERR_PREAUTH_FAILED;
+        rv = cctx->p11->C_GetTokenInfo(slotlist[i], &tinfo);
+        if (rv != CKR_OK) {
+            ret = p11err(context, rv, "C_GetTokenInfo");
             goto cleanup;
         }
 
@@ -3653,6 +3604,10 @@ pkinit_open_session(krb5_context context,
 
     ret = 0;
 cleanup:
+    /* On error, finalize the PKCS11 fields to ensure that we don't mistakenly
+     * short-circuit with success on the next call. */
+    if (ret)
+        pkinit_fini_pkcs11(cctx);
     free(slotlist);
     free(p11name);
     return ret;
@@ -3662,8 +3617,7 @@ cleanup:
  * Look for a key that's:
  * 1. private
  * 2. capable of the specified operation (usually signing or decrypting)
- * 3. RSA (this may be wrong but it's all we can do for now)
- * 4. matches the id of the cert we chose
+ * 3. matches the id of the cert we chose
  *
  * You must call pkinit_get_certs before calling pkinit_find_private_key
  * (that's because we need the ID of the private key)
@@ -3675,17 +3629,17 @@ cleanup:
  * If there are more than one, we just take the first one.
  */
 
-krb5_error_code
-pkinit_find_private_key(pkinit_identity_crypto_context id_cryptoctx,
+static krb5_error_code
+pkinit_find_private_key(krb5_context context,
+                        pkinit_identity_crypto_context id_cryptoctx,
                         CK_ATTRIBUTE_TYPE usage,
                         CK_OBJECT_HANDLE *objp)
 {
     CK_OBJECT_CLASS cls;
     CK_ATTRIBUTE attrs[4];
     CK_ULONG count;
-    CK_KEY_TYPE keytype;
+    CK_RV rv;
     unsigned int nattrs = 0;
-    int r;
 #ifdef PKINIT_USE_KEY_USAGE
     CK_BBOOL true_false;
 #endif
@@ -3710,29 +3664,26 @@ pkinit_find_private_key(pkinit_identity_crypto_context id_cryptoctx,
     nattrs++;
 #endif
 
-    keytype = CKK_RSA;
-    attrs[nattrs].type = CKA_KEY_TYPE;
-    attrs[nattrs].pValue = &keytype;
-    attrs[nattrs].ulValueLen = sizeof keytype;
-    nattrs++;
-
     attrs[nattrs].type = CKA_ID;
     attrs[nattrs].pValue = id_cryptoctx->cert_id;
     attrs[nattrs].ulValueLen = id_cryptoctx->cert_id_len;
     nattrs++;
 
-    r = id_cryptoctx->p11->C_FindObjectsInit(id_cryptoctx->session, attrs, nattrs);
-    if (r != CKR_OK) {
-        pkiDebug("krb5_pkinit_sign_data: C_FindObjectsInit: %s\n",
-                 pkcs11err(r));
+    rv = id_cryptoctx->p11->C_FindObjectsInit(id_cryptoctx->session, attrs,
+                                              nattrs);
+    if (rv != CKR_OK)
+        return p11err(context, rv, _("C_FindObjectsInit"));
+
+    rv = id_cryptoctx->p11->C_FindObjects(id_cryptoctx->session, objp, 1,
+                                          &count);
+    id_cryptoctx->p11->C_FindObjectsFinal(id_cryptoctx->session);
+    if (rv != CKR_OK)
+        return p11err(context, rv, _("C_FindObjects"));
+    if (count < 1) {
+        k5_setmsg(context, KRB5KDC_ERR_PREAUTH_FAILED,
+                  _("Found no private keys in PKCS11 token"));
         return KRB5KDC_ERR_PREAUTH_FAILED;
     }
-
-    r = id_cryptoctx->p11->C_FindObjects(id_cryptoctx->session, objp, 1, &count);
-    id_cryptoctx->p11->C_FindObjectsFinal(id_cryptoctx->session);
-    pkiDebug("found %d private keys (%s)\n", (int)count, pkcs11err(r));
-    if (r != CKR_OK || count < 1)
-        return KRB5KDC_ERR_PREAUTH_FAILED;
     return 0;
 }
 #endif
@@ -3754,6 +3705,116 @@ pkinit_sign_data_fs(krb5_context context,
 }
 
 #ifndef WITHOUT_PKCS11
+/*
+ * DER-encode a DigestInfo sequence containing the algorithm md and the digest
+ * mdbytes.
+ *
+ * DigestInfo ::= SEQUENCE {
+ *   digestAlgorithm  AlgorithmIdentifier,
+ *   digest  OCTET STRING
+ * }
+ */
+static krb5_error_code
+encode_digestinfo(krb5_context context, const EVP_MD *md,
+                  const uint8_t *mdbytes, size_t mdlen,
+                  uint8_t **encoding_out, size_t *len_out)
+{
+    krb5_boolean ok = FALSE;
+    X509_ALGOR *alg = NULL;
+    ASN1_OCTET_STRING *digest = NULL;
+    uint8_t *buf, *p;
+    int alg_len, digest_len, len;
+
+    *encoding_out = NULL;
+    *len_out = 0;
+
+    alg = X509_ALGOR_new();
+    if (alg == NULL ||
+        !X509_ALGOR_set0(alg, OBJ_nid2obj(EVP_MD_nid(md)), V_ASN1_NULL, NULL))
+        goto cleanup;
+    alg_len = i2d_X509_ALGOR(alg, NULL);
+    if (alg_len < 0)
+        goto cleanup;
+
+    digest = ASN1_OCTET_STRING_new();
+    if (digest == NULL || !ASN1_OCTET_STRING_set(digest, mdbytes, mdlen))
+        goto cleanup;
+    digest_len = i2d_ASN1_OCTET_STRING(digest, NULL);
+    if (digest_len < 0)
+        goto cleanup;
+
+    len = ASN1_object_size(1, alg_len + digest_len, V_ASN1_SEQUENCE);
+    p = buf = malloc(len);
+    if (buf == NULL)
+        goto cleanup;
+    ASN1_put_object(&p, 1, alg_len + digest_len, V_ASN1_SEQUENCE,
+                    V_ASN1_UNIVERSAL);
+    i2d_X509_ALGOR(alg, &p);
+    i2d_ASN1_OCTET_STRING(digest, &p);
+
+    *encoding_out = buf;
+    *len_out = len;
+    ok = TRUE;
+
+cleanup:
+    X509_ALGOR_free(alg);
+    ASN1_OCTET_STRING_free(digest);
+    if (!ok)
+        return oerr(context, 0, _("Failed to DER encode DigestInfo"));
+    return 0;
+}
+
+/* Extract the r and s values from a PKCS11 ECDSA signature and re-encode them
+ * in the DER representation of an ECDSA-Sig-Value for use in CMS. */
+static krb5_error_code
+convert_pkcs11_ecdsa_sig(krb5_context context,
+                         const uint8_t *p11sig, unsigned int p11siglen,
+                         uint8_t **sig_out, unsigned int *sig_len_out)
+{
+    krb5_boolean ok = FALSE;
+    BIGNUM *r = NULL, *s = NULL;
+    ECDSA_SIG *sig = NULL;
+    int len;
+    uint8_t *p;
+
+    *sig_out = NULL;
+    *sig_len_out = 0;
+
+    if (p11siglen % 2 != 0)
+        return EINVAL;
+
+    /* Extract the r and s values from the PKCS11 signature. */
+    r = BN_bin2bn(p11sig, p11siglen / 2, NULL);
+    s = BN_bin2bn(p11sig + p11siglen / 2, p11siglen / 2, NULL);
+    if (r == NULL || s == NULL)
+        goto cleanup;
+
+    /* Create an ECDSA-Sig-Value object and transfer ownership of r and s. */
+    sig = ECDSA_SIG_new();
+    if (sig == NULL || !ECDSA_SIG_set0(sig, r, s))
+        goto cleanup;
+    r = s = NULL;
+
+    /* DER-encode the ECDSA-Sig-Value object. */
+    len = i2d_ECDSA_SIG(sig, NULL);
+    if (len < 0)
+        goto cleanup;
+    p = *sig_out = malloc(len);
+    if (*sig_out == NULL)
+        goto cleanup;
+    *sig_len_out = len;
+    i2d_ECDSA_SIG(sig, &p);
+    ok = TRUE;
+
+cleanup:
+    BN_free(r);
+    BN_free(s);
+    ECDSA_SIG_free(sig);
+    if (!ok)
+        return oerr(context, 0, _("Failed to convert PKCS11 ECDSA signature"));
+    return 0;
+}
+
 static krb5_error_code
 pkinit_sign_data_pkcs11(krb5_context context,
                         pkinit_identity_crypto_context id_cryptoctx,
@@ -3762,27 +3823,85 @@ pkinit_sign_data_pkcs11(krb5_context context,
                         unsigned char **sig,
                         unsigned int *sig_len)
 {
+    krb5_error_code ret;
     CK_OBJECT_HANDLE obj;
     CK_ULONG len;
     CK_MECHANISM mech;
-    unsigned char *cp;
-    int r;
+    CK_SESSION_HANDLE session;
+    CK_FUNCTION_LIST_PTR p11;
+    CK_ATTRIBUTE attr;
+    CK_KEY_TYPE keytype;
+    CK_RV rv;
+    EVP_MD_CTX *ctx;
+    const EVP_MD *md = EVP_sha256();
+    unsigned int mdlen;
+    uint8_t mdbuf[EVP_MAX_MD_SIZE], *dinfo = NULL, *sigbuf = NULL, *input;
+    size_t dinfo_len, input_len;
 
-    if (pkinit_open_session(context, id_cryptoctx)) {
-        pkiDebug("can't open pkcs11 session\n");
-        return KRB5KDC_ERR_PREAUTH_FAILED;
+    *sig = NULL;
+    *sig_len = 0;
+
+    ret = pkinit_open_session(context, id_cryptoctx);
+    if (ret)
+        return ret;
+    p11 = id_cryptoctx->p11;
+    session = id_cryptoctx->session;
+
+    ret = pkinit_find_private_key(context, id_cryptoctx, CKA_SIGN, &obj);
+    if (ret)
+        return ret;
+
+    attr.type = CKA_KEY_TYPE;
+    attr.pValue = &keytype;
+    attr.ulValueLen = sizeof(keytype);
+    rv = p11->C_GetAttributeValue(session, obj, &attr, 1);
+    if (rv != CKR_OK) {
+        ret = p11err(context, rv, "C_GetAttributeValue");
+        goto cleanup;
     }
 
-    pkinit_find_private_key(id_cryptoctx, CKA_SIGN, &obj);
+    /*
+     * We would ideally use CKM_SHA256_RSA_PKCS and CKM_ECDSA_SHA256, but
+     * historically many cards seem to be confused about whether they are
+     * capable of mechanisms or not.  To be safe we compute the digest
+     * ourselves and use CKM_RSA_PKCS and CKM_ECDSA.
+     */
+    ctx = EVP_MD_CTX_new();
+    if (ctx == NULL) {
+        ret = KRB5KDC_ERR_PREAUTH_FAILED;
+        goto cleanup;
+    }
+    EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+    EVP_DigestUpdate(ctx, data, data_len);
+    EVP_DigestFinal_ex(ctx, mdbuf, &mdlen);
+    EVP_MD_CTX_free(ctx);
 
-    mech.mechanism = id_cryptoctx->mech;
+    if (keytype == CKK_RSA) {
+        /* For RSA we must also encode the digest in a DigestInfo sequence. */
+        mech.mechanism = CKM_RSA_PKCS;
+        ret = encode_digestinfo(context, md, mdbuf, mdlen, &dinfo, &dinfo_len);
+        if (ret)
+            goto cleanup;
+        input = dinfo;
+        input_len = dinfo_len;
+    } else if (keytype == CKK_EC) {
+        mech.mechanism = CKM_ECDSA;
+        input = mdbuf;
+        input_len = mdlen;
+    } else {
+        ret = KRB5KDC_ERR_PREAUTH_FAILED;
+        k5_setmsg(context, ret,
+                  _("PKCS11 certificate has unsupported key type %lu"),
+                  keytype);
+        goto cleanup;
+    }
     mech.pParameter = NULL;
     mech.ulParameterLen = 0;
 
-    if ((r = id_cryptoctx->p11->C_SignInit(id_cryptoctx->session, &mech,
-                                           obj)) != CKR_OK) {
-        pkiDebug("C_SignInit: %s\n", pkcs11err(r));
-        return KRB5KDC_ERR_PREAUTH_FAILED;
+    rv = p11->C_SignInit(session, &mech, obj);
+    if (rv != CKR_OK) {
+        ret = p11err(context, rv, "C_SignInit");
+        goto cleanup;
     }
 
     /*
@@ -3790,28 +3909,37 @@ pkinit_sign_data_pkcs11(krb5_context context,
      * get that. So guess, and if it's too small, re-malloc.
      */
     len = PK_SIGLEN_GUESS;
-    cp = malloc((size_t) len);
-    if (cp == NULL)
-        return ENOMEM;
+    sigbuf = k5alloc(len, &ret);
+    if (sigbuf == NULL)
+        goto cleanup;
 
-    r = id_cryptoctx->p11->C_Sign(id_cryptoctx->session, data,
-                                  (CK_ULONG) data_len, cp, &len);
-    if (r == CKR_BUFFER_TOO_SMALL || (r == CKR_OK && len >= PK_SIGLEN_GUESS)) {
-        free(cp);
-        pkiDebug("C_Sign realloc %d\n", (int) len);
-        cp = malloc((size_t) len);
-        r = id_cryptoctx->p11->C_Sign(id_cryptoctx->session, data,
-                                      (CK_ULONG) data_len, cp, &len);
+    rv = p11->C_Sign(session, input, input_len, sigbuf, &len);
+    if (rv == CKR_BUFFER_TOO_SMALL ||
+        (rv == CKR_OK && len >= PK_SIGLEN_GUESS)) {
+        free(sigbuf);
+        sigbuf = k5alloc(len, &ret);
+        if (sigbuf == NULL)
+            goto cleanup;
+        rv = p11->C_Sign(session, input, input_len, sigbuf, &len);
     }
-    if (r != CKR_OK) {
-        pkiDebug("C_Sign: %s\n", pkcs11err(r));
-        return KRB5KDC_ERR_PREAUTH_FAILED;
+    if (rv != CKR_OK) {
+        ret = p11err(context, rv, "C_Sign");
+        goto cleanup;
     }
-    pkiDebug("sign %d -> %d\n", (int) data_len, (int) len);
-    *sig_len = len;
-    *sig = cp;
 
-    return 0;
+    if (keytype == CKK_EC) {
+        /* PKCS11 ECDSA signatures must be re-encoded for CMS. */
+        ret = convert_pkcs11_ecdsa_sig(context, sigbuf, len, sig, sig_len);
+    } else {
+        *sig_len = len;
+        *sig = sigbuf;
+        sigbuf = NULL;
+    }
+
+cleanup:
+    free(dinfo);
+    free(sigbuf);
+    return ret;
 }
 #endif
 
@@ -4251,13 +4379,14 @@ reassemble_pkcs11_name(pkinit_identity_opts *idopts)
 }
 
 static krb5_error_code
-load_one_cert(CK_FUNCTION_LIST_PTR p11, CK_SESSION_HANDLE session,
-              pkinit_identity_opts *idopts, pkinit_cred_info *cred_out)
+load_one_cert(krb5_context context, CK_FUNCTION_LIST_PTR p11,
+              CK_SESSION_HANDLE session, pkinit_identity_opts *idopts,
+              pkinit_cred_info *cred_out)
 {
     krb5_error_code ret;
     CK_ATTRIBUTE attrs[2];
     CK_BYTE_PTR cert = NULL, cert_id = NULL;
-    CK_RV pret;
+    CK_RV rv;
     const unsigned char *cp;
     CK_OBJECT_HANDLE obj;
     CK_ULONG count;
@@ -4267,8 +4396,8 @@ load_one_cert(CK_FUNCTION_LIST_PTR p11, CK_SESSION_HANDLE session,
     *cred_out = NULL;
 
     /* Look for X.509 cert. */
-    pret = p11->C_FindObjects(session, &obj, 1, &count);
-    if (pret != CKR_OK || count <= 0)
+    rv = p11->C_FindObjects(session, &obj, 1, &count);
+    if (rv != CKR_OK || count <= 0)
         return 0;
 
     /* Get cert and id len. */
@@ -4278,10 +4407,9 @@ load_one_cert(CK_FUNCTION_LIST_PTR p11, CK_SESSION_HANDLE session,
     attrs[1].type = CKA_ID;
     attrs[1].pValue = NULL;
     attrs[1].ulValueLen = 0;
-    pret = p11->C_GetAttributeValue(session, obj, attrs, 2);
-    if (pret != CKR_OK && pret != CKR_BUFFER_TOO_SMALL) {
-        pkiDebug("C_GetAttributeValue: %s\n", pkcs11err(pret));
-        ret = KRB5KDC_ERR_PREAUTH_FAILED;
+    rv = p11->C_GetAttributeValue(session, obj, attrs, 2);
+    if (rv != CKR_OK && rv != CKR_BUFFER_TOO_SMALL) {
+        ret = p11err(context, rv, "C_GetAttributeValue");
         goto cleanup;
     }
 
@@ -4296,10 +4424,9 @@ load_one_cert(CK_FUNCTION_LIST_PTR p11, CK_SESSION_HANDLE session,
     attrs[0].pValue = cert;
     attrs[1].type = CKA_ID;
     attrs[1].pValue = cert_id;
-    pret = p11->C_GetAttributeValue(session, obj, attrs, 2);
-    if (pret != CKR_OK) {
-        pkiDebug("C_GetAttributeValue: %s\n", pkcs11err(pret));
-        ret = KRB5KDC_ERR_PREAUTH_FAILED;
+    rv = p11->C_GetAttributeValue(session, obj, attrs, 2);
+    if (rv != CKR_OK) {
+        ret = p11err(context, rv, "C_GetAttributeValue");
         goto cleanup;
     }
 
@@ -4309,7 +4436,8 @@ load_one_cert(CK_FUNCTION_LIST_PTR p11, CK_SESSION_HANDLE session,
     cp = (unsigned char *)cert;
     x = d2i_X509(NULL, &cp, (int)attrs[0].ulValueLen);
     if (x == NULL) {
-        ret = KRB5KDC_ERR_PREAUTH_FAILED;
+        ret = oerr(context, 0,
+                   _("Failed to decode X509 certificate from PKCS11 token"));
         goto cleanup;
     }
 
@@ -4347,7 +4475,7 @@ pkinit_get_certs_pkcs11(krb5_context context,
     int i;
     unsigned int nattrs;
     krb5_error_code ret;
-    CK_RV pret;
+    CK_RV rv;
 
     /* Copy stuff from idopts -> id_cryptoctx */
     if (idopts->p11_module_name != NULL) {
@@ -4393,15 +4521,6 @@ pkinit_get_certs_pkcs11(krb5_context context,
         return 0;
     }
 
-    /*
-     * We'd like to use CKM_SHA256_RSA_PKCS for signing if it's available, but
-     * historically many cards seem to be confused about whether they are
-     * capable of mechanisms or not. The safe thing seems to be to ignore the
-     * mechanism list, always use CKM_RSA_PKCS and calculate the sha256 digest
-     * ourselves.
-     */
-    id_cryptoctx->mech = CKM_RSA_PKCS;
-
     cls = CKO_CERTIFICATE;
     attrs[0].type = CKA_CLASS;
     attrs[0].pValue = &cls;
@@ -4428,16 +4547,16 @@ pkinit_get_certs_pkcs11(krb5_context context,
         nattrs++;
     }
 
-    pret = id_cryptoctx->p11->C_FindObjectsInit(id_cryptoctx->session, attrs,
-                                                nattrs);
-    if (pret != CKR_OK) {
-        pkiDebug("C_FindObjectsInit: %s\n", pkcs11err(pret));
+    rv = id_cryptoctx->p11->C_FindObjectsInit(id_cryptoctx->session, attrs,
+                                              nattrs);
+    if (rv != CKR_OK) {
+        ret = p11err(context, rv, "C_FindObjectsInit");
         return KRB5KDC_ERR_PREAUTH_FAILED;
     }
 
     for (i = 0; i < MAX_CREDS_ALLOWED; i++) {
-        ret = load_one_cert(id_cryptoctx->p11, id_cryptoctx->session, idopts,
-                            &id_cryptoctx->creds[i]);
+        ret = load_one_cert(context, id_cryptoctx->p11, id_cryptoctx->session,
+                            idopts, &id_cryptoctx->creds[i]);
         if (ret)
             return ret;
         if (id_cryptoctx->creds[i] == NULL)
@@ -4783,7 +4902,8 @@ cleanup:
 }
 
 /*
- * Set the certificate in idctx->creds[cred_index] as the selected certificate.
+ * Set the certificate in idctx->creds[cred_index] as the selected certificate,
+ * stealing pointers from it.
  */
 krb5_error_code
 crypto_cert_select(krb5_context context, pkinit_identity_crypto_context idctx,
@@ -4795,20 +4915,17 @@ crypto_cert_select(krb5_context context, pkinit_identity_crypto_context idctx,
         return ENOENT;
 
     ci = idctx->creds[cred_index];
-    /* copy the selected cert into our id_cryptoctx */
-    if (idctx->my_certs != NULL)
-        sk_X509_pop_free(idctx->my_certs, X509_free);
-    idctx->my_certs = sk_X509_new_null();
-    sk_X509_push(idctx->my_certs, ci->cert);
-    free(idctx->identity);
+
+    idctx->my_cert = ci->cert;
+    ci->cert = NULL;
+
     /* hang on to the selected credential name */
+    free(idctx->identity);
     if (ci->name != NULL)
         idctx->identity = strdup(ci->name);
     else
         idctx->identity = NULL;
 
-    ci->cert = NULL;       /* Don't free it twice */
-    idctx->cert_index = 0;
     if (idctx->pkcs11_method != 1) {
         idctx->my_key = ci->key;
         ci->key = NULL;    /* Don't free it twice */
@@ -4837,41 +4954,14 @@ crypto_cert_select_default(krb5_context context,
 
     retval = crypto_cert_get_count(id_cryptoctx, &cert_count);
     if (retval)
-        goto errout;
+        return retval;
 
     if (cert_count != 1) {
         TRACE_PKINIT_NO_DEFAULT_CERT(context, cert_count);
-        retval = EINVAL;
-        goto errout;
+        return EINVAL;
     }
-    /* copy the selected cert into our id_cryptoctx */
-    if (id_cryptoctx->my_certs != NULL) {
-        sk_X509_pop_free(id_cryptoctx->my_certs, X509_free);
-    }
-    id_cryptoctx->my_certs = sk_X509_new_null();
-    sk_X509_push(id_cryptoctx->my_certs, id_cryptoctx->creds[0]->cert);
-    id_cryptoctx->creds[0]->cert = NULL;        /* Don't free it twice */
-    id_cryptoctx->cert_index = 0;
-    /* hang on to the selected credential name */
-    if (id_cryptoctx->creds[0]->name != NULL)
-        id_cryptoctx->identity = strdup(id_cryptoctx->creds[0]->name);
-    else
-        id_cryptoctx->identity = NULL;
 
-    if (id_cryptoctx->pkcs11_method != 1) {
-        id_cryptoctx->my_key = id_cryptoctx->creds[0]->key;
-        id_cryptoctx->creds[0]->key = NULL;     /* Don't free it twice */
-    }
-#ifndef WITHOUT_PKCS11
-    else {
-        id_cryptoctx->cert_id = id_cryptoctx->creds[0]->cert_id;
-        id_cryptoctx->creds[0]->cert_id = NULL; /* Don't free it twice */
-        id_cryptoctx->cert_id_len = id_cryptoctx->creds[0]->cert_id_len;
-    }
-#endif
-    retval = 0;
-errout:
-    return retval;
+    return crypto_cert_select(context, id_cryptoctx, 0);
 }
 
 
@@ -5451,19 +5541,26 @@ print_pubkey(BIGNUM * key, char *msg)
 }
 #endif
 
-static const char *
-pkcs11err(int err)
+#ifndef WITHOUT_PKCS11
+static krb5_error_code
+p11err(krb5_context context, CK_RV rv, const char *op)
 {
+    krb5_error_code code = KRB5KDC_ERR_PREAUTH_FAILED;
     int i;
+    const char *msg;
 
-    for (i = 0; pkcs11_errstrings[i].text != NULL; i++)
-        if (pkcs11_errstrings[i].code == err)
+    for (i = 0; pkcs11_errstrings[i].text != NULL; i++) {
+        if (pkcs11_errstrings[i].code == rv)
             break;
-    if (pkcs11_errstrings[i].text != NULL)
-        return (pkcs11_errstrings[i].text);
+    }
+    msg = pkcs11_errstrings[i].text;
+    if (msg == NULL)
+        msg = "unknown PKCS11 error";
 
-    return "unknown PKCS11 error";
+    krb5_set_error_message(context, code, _("PKCS11 error (%s): %s"), op, msg);
+    return code;
 }
+#endif
 
 /*
  * Add an item to the pkinit_identity_crypto_context's list of deferred
