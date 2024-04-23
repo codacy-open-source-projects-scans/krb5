@@ -373,6 +373,40 @@ test_merge_subsections(void)
     profile_release(p);
 }
 
+/* Regression test for #9110 (null dereference when modifying an empty
+ * profile), and various other operations on an initially empty profile. */
+static void
+test_empty(void)
+{
+    profile_t p, p2;
+    const char *n1[] = { "section", NULL };
+    const char *n2[] = { "section", "var", NULL };
+    char **values;
+
+    check(profile_init(NULL, &p));
+    check(profile_add_relation(p, n1, NULL));
+    check(profile_add_relation(p, n2, "value"));
+    check(profile_flush(p));    /* should succeed but do nothing */
+    check(profile_get_values(p, n2, &values));
+    assert(strcmp(values[0], "value") == 0 && values[1] == NULL);
+    profile_free_list(values);
+
+    check(profile_copy(p, &p2));
+    check(profile_get_values(p2, n2, &values));
+    assert(strcmp(values[0], "value") == 0 && values[1] == NULL);
+    profile_free_list(values);
+    profile_release(p2);
+
+    profile_flush_to_file(p, "test3.ini");
+    profile_release(p);
+
+    profile_init_path("test3.ini", &p);
+    check(profile_get_values(p, n2, &values));
+    assert(strcmp(values[0], "value") == 0 && values[1] == NULL);
+    profile_free_list(values);
+    profile_release(p);
+}
+
 int
 main(void)
 {
@@ -386,4 +420,5 @@ main(void)
     test_delete_ordering();
     test_flush_to_file();
     test_merge_subsections();
+    test_empty();
 }
