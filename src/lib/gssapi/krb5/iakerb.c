@@ -31,6 +31,7 @@
  */
 
 enum iakerb_state {
+    IAKERB_REALM_DISCOVERY, /* querying server for its realm */
     IAKERB_AS_REQ,      /* acquiring ticket with initial creds */
     IAKERB_TGS_REQ,     /* acquiring ticket with TGT */
     IAKERB_AP_REQ       /* hand-off to normal GSS AP-REQ exchange */
@@ -75,6 +76,46 @@ iakerb_release_context(iakerb_ctx_id_t ctx)
     krb5_get_init_creds_opt_free(ctx->k5c, ctx->gic_opts);
     krb5_free_context(ctx->k5c);
     free(ctx);
+}
+
+/* Encode a KRB-ERROR message with the given protocol code.  Use the server
+ * principal from verifier_cred if one is available. */
+static krb5_error_code
+iakerb_mk_error(krb5_context context, gss_cred_id_t verifier_cred,
+                int protocol_err, krb5_data *enc_err)
+{
+    krb5_error error = { 0 };
+    krb5_gss_cred_id_t cred = (krb5_gss_cred_id_t)verifier_cred;
+
+    error.error = protocol_err;
+
+    /* We must provide a server principal, although we expect the recipient to
+     * care chiefly about the error code. */
+    if (cred != NULL && cred->name != NULL)
+        error.server = cred->name->princ;
+    else
+        error.server = (krb5_principal)krb5_anonymous_principal();
+
+    return krb5_mk_error(context, &error, enc_err);
+}
+
+/* Decode a KRB-ERROR message and return the associated com_err code. */
+static krb5_error_code
+iakerb_rd_error(krb5_context context, const krb5_data *enc_err)
+{
+    krb5_error_code ret;
+    krb5_error *error;
+
+    ret = krb5_rd_error(context, enc_err, &error);
+    if (ret)
+        return ret;
+
+    if (error->error > 0 && error->error <= KRB_ERR_MAX)
+        ret = error->error + ERROR_TABLE_BASE_krb5;
+    else
+        ret = KRB5KRB_ERR_GENERIC;
+    krb5_free_error(context, error);
+    return ret;
 }
 
 /*
@@ -220,7 +261,8 @@ cleanup:
 }
 
 /*
- * Create a token from IAKERB-HEADER and KRB-KDC-REQ/REP
+ * Create a token from IAKERB-HEADER and KRB-KDC-REQ/REP.  Save the generated
+ * token for the finish checksum and increment the message count.
  */
 static krb5_error_code
 iakerb_make_token(iakerb_ctx_id_t ctx,
@@ -276,6 +318,11 @@ iakerb_make_token(iakerb_ctx_id_t ctx,
     k5_buf_add_len(&buf, data->data, data->length);
     assert(buf.len == token->length);
 
+    code = iakerb_save_token(ctx, token);
+    if (code != 0)
+        goto cleanup;
+    ctx->count++;
+
 cleanup:
     krb5_free_data(ctx->k5c, data);
 
@@ -291,7 +338,6 @@ iakerb_acceptor_realm(iakerb_ctx_id_t ctx, gss_cred_id_t verifier_cred,
     OM_uint32 dummy;
     krb5_gss_cred_id_t cred = (krb5_gss_cred_id_t)verifier_cred;
     krb5_data realm = empty_data(), reply = empty_data();
-    krb5_error error = { 0 };
     char *defrealm = NULL;
 
     /* Get the acceptor realm from the verifier cred if we can; otherwise try
@@ -303,8 +349,8 @@ iakerb_acceptor_realm(iakerb_ctx_id_t ctx, gss_cred_id_t verifier_cred,
         ret = krb5_get_default_realm(ctx->k5c, &defrealm);
         if (ret) {
             /* Generate an error reply if there is no default realm. */
-            error.error = KRB_ERR_GENERIC;
-            ret = krb5_mk_error(ctx->k5c, &error, &reply);
+            ret = iakerb_mk_error(ctx->k5c, verifier_cred,
+                                  KRB_AP_ERR_IAKERB_KDC_NOT_FOUND, &reply);
             if (ret)
                 goto cleanup;
         } else {
@@ -315,11 +361,6 @@ iakerb_acceptor_realm(iakerb_ctx_id_t ctx, gss_cred_id_t verifier_cred,
     ret = iakerb_make_token(ctx, &realm, NULL, &reply, output_token);
     if (ret)
         goto cleanup;
-    ret = iakerb_save_token(ctx, output_token);
-    if (ret)
-        goto cleanup;
-
-    ctx->count++;
 
 cleanup:
     if (ret)
@@ -344,7 +385,7 @@ iakerb_acceptor_step(iakerb_ctx_id_t ctx, gss_cred_id_t verifier_cred,
     krb5_data request = empty_data(), reply = empty_data();
     krb5_data realm = empty_data();
     OM_uint32 tmp;
-    int tcp_only, use_primary;
+    int tcp_only, use_primary, protocol_err;
     krb5_ui_4 kdc_code;
 
     output_token->length = 0;
@@ -394,29 +435,16 @@ iakerb_acceptor_step(iakerb_ctx_id_t ctx, gss_cred_id_t verifier_cred,
     }
 
     if (code == KRB5_KDC_UNREACH || code == KRB5_REALM_UNKNOWN) {
-        krb5_error error;
-
-        memset(&error, 0, sizeof(error));
-        if (code == KRB5_KDC_UNREACH)
-            error.error = KRB_AP_ERR_IAKERB_KDC_NO_RESPONSE;
-        else if (code == KRB5_REALM_UNKNOWN)
-            error.error = KRB_AP_ERR_IAKERB_KDC_NOT_FOUND;
-
-        code = krb5_mk_error(ctx->k5c, &error, &reply);
+        protocol_err = (code == KRB5_KDC_UNREACH) ?
+            KRB_AP_ERR_IAKERB_KDC_NO_RESPONSE :
+            KRB_AP_ERR_IAKERB_KDC_NOT_FOUND;
+        code = iakerb_mk_error(ctx->k5c, verifier_cred, protocol_err, &reply);
         if (code != 0)
             goto cleanup;
     } else if (code != 0)
         goto cleanup;
 
     code = iakerb_make_token(ctx, &realm, NULL, &reply, output_token);
-    if (code != 0)
-        goto cleanup;
-
-    code = iakerb_save_token(ctx, output_token);
-    if (code != 0)
-        goto cleanup;
-
-    ctx->count++;
 
 cleanup:
     if (code != 0)
@@ -548,26 +576,62 @@ iakerb_initiator_step(iakerb_ctx_id_t ctx,
                       gss_buffer_t output_token)
 {
     krb5_error_code code = 0;
-    krb5_data in = empty_data(), out = empty_data(), realm = empty_data();
+    krb5_data in = empty_data(), out = empty_data();
+    krb5_data realm = empty_data(), server_realm = empty_data();
     krb5_data *cookie = NULL;
     OM_uint32 tmp;
     unsigned int flags = 0;
     krb5_ticket_times times;
+    krb5_boolean first_token;
 
     output_token->length = 0;
     output_token->value = NULL;
 
-    if (input_token != GSS_C_NO_BUFFER && input_token->length > 0) {
-        code = iakerb_parse_token(ctx, input_token, NULL, &cookie, &in);
+    first_token = (input_token == GSS_C_NO_BUFFER || input_token->length == 0);
+    if (!first_token) {
+        code = iakerb_parse_token(ctx, input_token, &server_realm, &cookie,
+                                  &in);
         if (code != 0)
             goto cleanup;
 
         code = iakerb_save_token(ctx, input_token);
         if (code != 0)
             goto cleanup;
+
+        if (krb5_is_krb_error(&in)) {
+            code = iakerb_rd_error(ctx->k5c, &in);
+            if (code == KRB5KRB_AP_ERR_IAKERB_KDC_NOT_FOUND &&
+                ctx->state == IAKERB_REALM_DISCOVERY) {
+                save_error_string(code, _("The IAKERB proxy could not "
+                                          "determine its realm"));
+            }
+            if (code == KRB5KRB_AP_ERR_IAKERB_KDC_NOT_FOUND ||
+                code == KRB5KRB_AP_ERR_IAKERB_KDC_NO_RESPONSE)
+                goto cleanup;
+            code = 0;
+        }
     }
 
     switch (ctx->state) {
+    case IAKERB_REALM_DISCOVERY:
+        if (first_token) {
+            /* Send the discovery request. */
+            code = iakerb_make_token(ctx, &realm, cookie, &out, output_token);
+            goto cleanup;
+        }
+
+        /* The acceptor should have sent us its realm. */
+        if (server_realm.length == 0) {
+            code = KRB5_BAD_MSIZE;
+            goto cleanup;
+        }
+
+        /* Steal the received server realm for the client principal. */
+        krb5_free_data_contents(ctx->k5c, &cred->name->princ->realm);
+        cred->name->princ->realm = server_realm;
+        server_realm = empty_data();
+
+        /* Done with realm discovery; fall through to AS request. */
     case IAKERB_AS_REQ:
         if (ctx->icc == NULL) {
             code = iakerb_init_creds_ctx(ctx, cred, time_req);
@@ -626,17 +690,7 @@ iakerb_initiator_step(iakerb_ctx_id_t ctx,
 
     if (out.length != 0) {
         assert(ctx->state != IAKERB_AP_REQ);
-
         code = iakerb_make_token(ctx, &realm, cookie, &out, output_token);
-        if (code != 0)
-            goto cleanup;
-
-        /* Save the token for generating a future checksum */
-        code = iakerb_save_token(ctx, output_token);
-        if (code != 0)
-            goto cleanup;
-
-        ctx->count++;
     }
 
 cleanup:
@@ -644,6 +698,7 @@ cleanup:
         gss_release_buffer(&tmp, output_token);
     krb5_free_data(ctx->k5c, cookie);
     krb5_free_data_contents(ctx->k5c, &out);
+    krb5_free_data_contents(ctx->k5c, &server_realm);
     krb5_free_data_contents(ctx->k5c, &realm);
 
     return code;
@@ -662,6 +717,11 @@ iakerb_get_initial_state(iakerb_ctx_id_t ctx,
 {
     krb5_creds in_creds, *out_creds = NULL;
     krb5_error_code code;
+
+    if (cred->name->princ->realm.length == 0) {
+        *state = IAKERB_REALM_DISCOVERY;
+        return 0;
+    }
 
     memset(&in_creds, 0, sizeof(in_creds));
 
@@ -798,9 +858,9 @@ iakerb_gss_accept_sec_context(OM_uint32 *minor_status,
     OM_uint32 major_status = GSS_S_FAILURE;
     OM_uint32 code;
     iakerb_ctx_id_t ctx;
-    int initialContextToken = (*context_handle == GSS_C_NO_CONTEXT);
+    krb5_boolean first_token = (*context_handle == GSS_C_NO_CONTEXT);
 
-    if (initialContextToken) {
+    if (first_token) {
         code = iakerb_alloc_context(&ctx, 0);
         if (code != 0)
             goto cleanup;
@@ -821,10 +881,6 @@ iakerb_gss_accept_sec_context(OM_uint32 *minor_status,
             major_status = GSS_S_DEFECTIVE_TOKEN;
         if (code != 0)
             goto cleanup;
-        if (initialContextToken) {
-            *context_handle = (gss_ctx_id_t)ctx;
-            ctx = NULL;
-        }
         if (src_name != NULL)
             *src_name = GSS_C_NO_NAME;
         if (ret_flags != NULL)
@@ -859,9 +915,13 @@ iakerb_gss_accept_sec_context(OM_uint32 *minor_status,
         *mech_type = gss_mech_iakerb;
 
 cleanup:
-    if (initialContextToken && GSS_ERROR(major_status)) {
-        iakerb_release_context(ctx);
-        *context_handle = GSS_C_NO_CONTEXT;
+    if (first_token) {
+        if (GSS_ERROR(major_status)) {
+            iakerb_release_context(ctx);
+            *context_handle = GSS_C_NO_CONTEXT;
+        } else {
+            *context_handle = (gss_ctx_id_t)ctx;
+        }
     }
 
     *minor_status = code;

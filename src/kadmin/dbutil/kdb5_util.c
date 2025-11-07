@@ -522,7 +522,7 @@ add_random_key(int argc, char **argv)
 
     int free_keysalts;
     char *me = progname;
-    char *ks_str = NULL;
+    char *ks_str = "";
     char *pr_str;
     krb5_keyblock *tmp_mkey;
 
@@ -600,6 +600,9 @@ add_random_key(int argc, char **argv)
         exit_status++;
         return;
     }
+
+    dbent->mask |= KADM5_ATTRIBUTES | KADM5_KEY_DATA | KADM5_TL_DATA;
+
     ret = krb5_db_put_principal(util_context, dbent);
     krb5_db_free_principal(util_context, dbent);
     if (ret) {

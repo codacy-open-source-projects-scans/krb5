@@ -21,7 +21,7 @@ obj/
 skiptests
 testdir/
 testlog
-testtrace
+testtrace*
 
 # Ignore the build directory
 /build/
@@ -258,6 +258,7 @@ local.properties
 /src/kdc/rtest
 /src/kdc/t_ndr
 /src/kdc/t_replay
+/src/kdc/t_sockact
 
 /src/lib/k5sprt32.def
 

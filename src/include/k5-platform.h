@@ -70,6 +70,10 @@
 #include <unistd.h>
 #endif
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #ifdef _WIN32
 #define CAN_COPY_VA_LIST
 #endif
@@ -372,34 +376,8 @@ typedef struct { int error; unsigned char did_run; } k5_init_t;
    matter what compiler we're using.  Do it the same way
    regardless.  */
 
-# ifdef __hpux
-
-     /* On HP-UX, we need this auxiliary function.  At dynamic load or
-        unload time (but *not* program startup and termination for
-        link-time specified libraries), the linker-indicated function
-        is called with a handle on the library and a flag indicating
-        whether it's being loaded or unloaded.
-
-        The "real" fini function doesn't need to be exported, so
-        declare it static.
-
-        As usual, the final declaration is just for syntactic
-        convenience, so the top-level invocation of this macro can be
-        followed by a semicolon.  */
-
-#  include <dl.h>
-#  define MAKE_FINI_FUNCTION(NAME)                                          \
-        static void NAME(void);                                             \
-        void JOIN__2(NAME, auxfini)(shl_t, int); /* silence gcc warnings */ \
-        void JOIN__2(NAME, auxfini)(shl_t h, int l) { if (!l) NAME(); }     \
-        static void NAME(void)
-
-# else /* not hpux */
-
 #  define MAKE_FINI_FUNCTION(NAME)      \
         void NAME(void)
-
-# endif
 
 #elif !defined(SHARED) || defined(LIB_UNLOAD_PREVENTED)
 
@@ -1150,5 +1128,9 @@ extern char *k5_secure_getenv(const char *name);
  * sorted according to strcmp().  Return 0 on success, or ENOENT/ENOMEM. */
 int k5_dir_filenames(const char *dirname, char ***fnames_out);
 void k5_free_filenames(char **fnames);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* K5_PLATFORM_H */

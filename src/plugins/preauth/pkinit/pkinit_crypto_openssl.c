@@ -34,7 +34,6 @@
 #include "k5-err.h"
 #include "k5-hex.h"
 #include "pkinit.h"
-#include <dirent.h>
 
 #include <openssl/bn.h>
 #include <openssl/dh.h>
@@ -506,7 +505,7 @@ encode_spki(EVP_PKEY *pkey, krb5_data *spki_out)
     ASN1_TYPE parameter;
     ASN1_STRING param_str, pubkey_str;
 
-    if (EVP_PKEY_base_id(pkey) != EVP_PKEY_DH) {
+    if (EVP_PKEY_get_base_id(pkey) != EVP_PKEY_DH) {
         /* Only DH keys require special encoding. */
         len = i2d_PUBKEY(pkey, NULL);
         ret = alloc_data(spki_out, len);
@@ -1867,7 +1866,7 @@ cms_signeddata_create(krb5_context context,
 #ifdef DEBUG_SIG
         print_buffer(sig, sig_len);
 #endif
-        free(abuf);
+        OPENSSL_free(abuf);
         if (retval)
             goto cleanup2;
 
@@ -2652,11 +2651,11 @@ cleanup:
 static const EVP_MD *
 algid_to_md(const krb5_data *alg_id)
 {
-    if (data_eq(*alg_id, sha1_id))
+    if (data_eq(*alg_id, kdf_sha1_id))
         return EVP_sha1();
-    if (data_eq(*alg_id, sha256_id))
+    if (data_eq(*alg_id, kdf_sha256_id))
         return EVP_sha256();
-    if (data_eq(*alg_id, sha512_id))
+    if (data_eq(*alg_id, kdf_sha512_id))
         return EVP_sha512();
     return NULL;
 }
@@ -4012,7 +4011,7 @@ create_signature(unsigned char **sig, unsigned int *sig_len,
         return ENOMEM;
     EVP_SignInit(ctx, EVP_sha256());
     EVP_SignUpdate(ctx, data, data_len);
-    *sig_len = EVP_PKEY_size(pkey);
+    *sig_len = EVP_PKEY_get_size(pkey);
     if ((*sig = malloc(*sig_len)) == NULL)
         goto cleanup;
     EVP_SignFinal(ctx, *sig, sig_len, pkey);
@@ -4304,12 +4303,9 @@ pkinit_get_certs_dir(krb5_context context,
                      krb5_principal princ)
 {
     krb5_error_code retval = ENOMEM;
-    DIR *d = NULL;
-    struct dirent *dentry = NULL;
-    char certname[1024];
-    char keyname[1024];
-    int i = 0, len;
-    char *dirname, *suf;
+    int ncreds = 0, len, i;
+    char *dirname, *suf, *name, **fnames = NULL;
+    char *certname = NULL, *keyname = NULL;
 
     if (idopts->cert_filename == NULL) {
         TRACE_PKINIT_NO_CERT(context);
@@ -4317,53 +4313,51 @@ pkinit_get_certs_dir(krb5_context context,
     }
 
     dirname = idopts->cert_filename;
-    d = opendir(dirname);
-    if (d == NULL)
-        return errno;
+    retval = k5_dir_filenames(dirname, &fnames);
+    if (retval)
+        return retval;
 
     /*
      * We'll assume that certs are named XXX.crt and the corresponding
      * key is named XXX.key
      */
-    while ((i < MAX_CREDS_ALLOWED) &&  (dentry = readdir(d)) != NULL) {
-        /* Ignore subdirectories and anything starting with a dot */
-#ifdef DT_DIR
-        if (dentry->d_type == DT_DIR)
+    for (i = 0; fnames[i] != NULL; i++) {
+        /* Ignore anything starting with a dot */
+        name = fnames[i];
+        if (name[0] == '.')
             continue;
-#endif
-        if (dentry->d_name[0] == '.')
-            continue;
-        len = strlen(dentry->d_name);
+        len = strlen(name);
         if (len < 5)
             continue;
-        suf = dentry->d_name + (len - 4);
+        suf = name + (len - 4);
         if (strncmp(suf, ".crt", 4) != 0)
             continue;
 
-        /* Checked length */
-        if (strlen(dirname) + strlen(dentry->d_name) + 2 > sizeof(certname)) {
-            pkiDebug("%s: Path too long -- directory '%s' and file '%s'\n",
-                     __FUNCTION__, dirname, dentry->d_name);
-            continue;
-        }
-        snprintf(certname, sizeof(certname), "%s/%s", dirname, dentry->d_name);
-        snprintf(keyname, sizeof(keyname), "%s/%s", dirname, dentry->d_name);
+        retval = k5_path_join(dirname, name, &certname);
+        if (retval)
+            goto cleanup;
+        retval = k5_path_join(dirname, name, &keyname);
+        if (retval)
+            goto cleanup;
+
         len = strlen(keyname);
         keyname[len - 3] = 'k';
         keyname[len - 2] = 'e';
         keyname[len - 1] = 'y';
 
         retval = pkinit_load_fs_cert_and_key(context, id_cryptoctx,
-                                             certname, keyname, i);
-        if (retval == 0) {
-            TRACE_PKINIT_LOADED_CERT(context, dentry->d_name);
-            i++;
+                                             certname, keyname, ncreds);
+        free(certname);
+        free(keyname);
+        certname = keyname = NULL;
+        if (!retval) {
+            TRACE_PKINIT_LOADED_CERT(context, name);
+            if (++ncreds >= MAX_CREDS_ALLOWED)
+                break;
         }
-        else
-            continue;
     }
 
-    if (!id_cryptoctx->defer_id_prompt && i == 0) {
+    if (!id_cryptoctx->defer_id_prompt && ncreds == 0) {
         TRACE_PKINIT_NO_CERT_AND_KEY(context, idopts->cert_filename);
         retval = ENOENT;
         goto cleanup;
@@ -4372,9 +4366,9 @@ pkinit_get_certs_dir(krb5_context context,
     retval = 0;
 
 cleanup:
-    if (d)
-        closedir(d);
-
+    k5_free_filenames(fnames);
+    free(certname);
+    free(keyname);
     return retval;
 }
 
@@ -5166,34 +5160,28 @@ load_cas_and_crls_dir(krb5_context context,
                       char *dirname)
 {
     krb5_error_code retval = EINVAL;
-    DIR *d = NULL;
-    struct dirent *dentry = NULL;
-    char filename[1024];
+    char **fnames = NULL, *filename;
+    int i;
 
     if (dirname == NULL)
         return EINVAL;
 
-    d = opendir(dirname);
-    if (d == NULL)
-        return ENOENT;
+    retval = k5_dir_filenames(dirname, &fnames);
+    if (retval)
+        return retval;
 
-    while ((dentry = readdir(d))) {
-        if (strlen(dirname) + strlen(dentry->d_name) + 2 > sizeof(filename)) {
-            pkiDebug("%s: Path too long -- directory '%s' and file '%s'\n",
-                     __FUNCTION__, dirname, dentry->d_name);
+    for (i = 0; fnames[i] != NULL; i++) {
+        /* Ignore anything starting with a dot */
+        if (fnames[i][0] == '.')
+            continue;
+
+        retval = k5_path_join(dirname, fnames[i], &filename);
+        if (retval)
             goto cleanup;
-        }
-        /* Ignore subdirectories and anything starting with a dot */
-#ifdef DT_DIR
-        if (dentry->d_type == DT_DIR)
-            continue;
-#endif
-        if (dentry->d_name[0] == '.')
-            continue;
-        snprintf(filename, sizeof(filename), "%s/%s", dirname, dentry->d_name);
 
         retval = load_cas_and_crls(context, plg_cryptoctx, req_cryptoctx,
                                    id_cryptoctx, catype, filename);
+        free(filename);
         if (retval)
             goto cleanup;
     }
@@ -5201,9 +5189,7 @@ load_cas_and_crls_dir(krb5_context context,
     retval = 0;
 
 cleanup:
-    if (d != NULL)
-        closedir(d);
-
+    k5_free_filenames(fnames);
     return retval;
 }
 
@@ -5712,3 +5698,123 @@ parse_dh_min_bits(krb5_context context, const char *str)
     TRACE_PKINIT_DH_INVALID_MIN_BITS(context, str);
     return PKINIT_DEFAULT_DH_MIN_BITS;
 }
+
+/* Return the OpenSSL message digest type matching the given CMS OID, or NULL
+ * if it doesn't match any of the CMS OIDs we know about. */
+static const EVP_MD *
+md_from_cms_oid(const krb5_data *alg_id)
+{
+    if (data_eq(*alg_id, cms_sha1_id))
+        return EVP_sha1();
+    if (data_eq(*alg_id, cms_sha256_id))
+        return EVP_sha256();
+    if (data_eq(*alg_id, cms_sha384_id))
+        return EVP_sha384();
+    if (data_eq(*alg_id, cms_sha512_id))
+        return EVP_sha512();
+    return NULL;
+}
+
+/* Compute a message digest of the given type over body, placing the result in
+ * *digest_out in allocated storage.  Return true on success. */
+static krb5_boolean
+make_digest(const krb5_data *body, const EVP_MD *md, krb5_data *digest_out)
+{
+    krb5_error_code ret;
+    krb5_data d;
+
+    if (md == NULL)
+        return FALSE;
+    ret = alloc_data(&d, EVP_MD_size(md));
+    if (ret)
+        return FALSE;
+    if (!EVP_Digest(body->data, body->length, (uint8_t *)d.data, &d.length, md,
+                    NULL)) {
+        free(d.data);
+        return FALSE;
+    }
+    *digest_out = d;
+    return TRUE;
+}
+
+/* Return true if digest verifies for the given body and message digest
+ * type. */
+static krb5_boolean
+check_digest(const krb5_data *body, const EVP_MD *md, const krb5_data *digest)
+{
+    unsigned int digest_len;
+    uint8_t buf[EVP_MAX_MD_SIZE];
+
+    if (md == NULL)
+        return FALSE;
+    if (!EVP_Digest(body->data, body->length, buf, &digest_len, md, NULL))
+        return FALSE;
+    return (digest->length == digest_len &&
+            CRYPTO_memcmp(digest->data, buf, digest_len) == 0);
+}
+
+krb5_error_code
+crypto_generate_checksums(krb5_context context, const krb5_data *body,
+                          krb5_data *cksum1_out, krb5_pachecksum2 **cksum2_out)
+{
+    krb5_data cksum1 = empty_data();
+    krb5_pachecksum2 *cksum2 = NULL;
+    krb5_error_code ret;
+
+    if (!make_digest(body, EVP_sha1(), &cksum1))
+        goto fail;
+
+    cksum2 = k5alloc(sizeof(*cksum2), &ret);
+    if (cksum2 == NULL)
+        goto fail;
+
+    if (!make_digest(body, EVP_sha256(), &cksum2->checksum))
+        goto fail;
+
+    if (krb5int_copy_data_contents(context, &cms_sha256_id,
+                                   &cksum2->algorithmIdentifier.algorithm))
+        goto fail;
+
+    cksum2->algorithmIdentifier.parameters = empty_data();
+
+    *cksum1_out = cksum1;
+    *cksum2_out = cksum2;
+    return 0;
+
+fail:
+    krb5_free_data_contents(context, &cksum1);
+    free_pachecksum2(context, &cksum2);
+    return KRB5_CRYPTO_INTERNAL;
+}
+
+krb5_error_code
+crypto_verify_checksums(krb5_context context, krb5_data *body,
+                        const krb5_data *cksum1,
+                        const krb5_pachecksum2 *cksum2)
+{
+    const EVP_MD *md;
+
+    /* RFC 4556 doesn't say what error to return if the checksum doesn't match.
+     * Windows returns this one. */
+    if (!check_digest(body, EVP_sha1(), cksum1))
+        return KRB5KRB_AP_ERR_MODIFIED;
+
+    if (cksum2 == NULL)
+        return 0;
+
+    md = md_from_cms_oid(&cksum2->algorithmIdentifier.algorithm);
+    if (!check_digest(body, md, &cksum2->checksum))
+        return KRB5KRB_AP_ERR_MODIFIED;
+
+    return 0;
+}
+
+#ifdef _WIN32
+BOOL WINAPI
+DllMain(HANDLE hModule, DWORD fdwReason, LPVOID lpvReserved)
+{
+    if (fdwReason == DLL_PROCESS_ATTACH)
+        pkinit_openssl_init__auxinit();
+    return TRUE;
+}
+#endif /* _WIN32 */

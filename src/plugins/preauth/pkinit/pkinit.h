@@ -97,7 +97,9 @@ static inline void pkiDebug (const char *fmt, ...) { }
 
 /* Solaris compiler doesn't grok __FUNCTION__
  * hack for now.  Fix all the uses eventually. */
+#ifndef _WIN32
 #define __FUNCTION__ __func__
+#endif
 
 /* Macros to deal with converting between various data types... */
 #define PADATA_TO_KRB5DATA(pad, k5d) \
@@ -338,6 +340,7 @@ void free_krb5_external_principal_identifier(krb5_external_principal_identifier 
 void free_krb5_algorithm_identifiers(krb5_algorithm_identifier ***in);
 void free_krb5_algorithm_identifier(krb5_algorithm_identifier *in);
 void free_krb5_kdc_dh_key_info(krb5_kdc_dh_key_info **in);
+void free_pachecksum2(krb5_context context, krb5_pachecksum2 **in);
 krb5_error_code pkinit_copy_krb5_data(krb5_data *dst, const krb5_data *src);
 
 

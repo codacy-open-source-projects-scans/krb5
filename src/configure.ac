@@ -351,6 +351,14 @@ if test "$with_keyutils" != no; then
   fi
 fi
 
+# Check for keyctl.  If it is found, define a command prefix for
+# running a command inside a keyring session.  Include "env" in the
+# wrapper to allow environment variable settings in the wrapped
+# command.
+AC_CHECK_PROG(KEYCTL,keyctl,keyctl)
+AS_IF([test x"$KEYCTL" != x], [KEYCTL_SESSION="keyctl session - env"])
+AC_SUBST([KEYCTL_SESSION])
+
 # The SPAKE preauth plugin currently supports edwards25519 natively,
 # and can support three NIST groups using OpenSSL.
 HAVE_SPAKE_OPENSSL=no
@@ -490,18 +498,9 @@ AC_SUBST(GETTIMEOFDAY_ST_OBJ)
 AC_SUBST(EXTRA_SUPPORT_SYMS)
 
 DECLARE_SYS_ERRLIST
-AC_CHECK_HEADERS(unistd.h paths.h regex.h regexpr.h fcntl.h memory.h ifaddrs.h sys/filio.h byteswap.h machine/endian.h machine/byte_order.h sys/bswap.h endian.h pwd.h arpa/inet.h alloca.h dlfcn.h limits.h sys/random.h)
-AC_CHECK_HEADER(regexp.h, [], [],
-[#define INIT char *sp = instring;
-#define GETC() (*sp++)
-#define PEEKC() (*sp)
-#define UNGETC(c) (--sp)
-#define RETURN(c) return(c)
-#define ERROR(c)
-])
+AC_CHECK_HEADERS(unistd.h paths.h fcntl.h memory.h ifaddrs.h sys/filio.h byteswap.h machine/endian.h machine/byte_order.h sys/bswap.h endian.h pwd.h arpa/inet.h alloca.h dlfcn.h limits.h sys/random.h)
 AC_CHECK_MEMBERS([struct stat.st_mtimensec,struct stat.st_mtimespec.tv_nsec,struct stat.st_mtim.tv_nsec],,,[#include <sys/types.h>
 #include <sys/stat.h>])
-KRB5_AC_REGEX_FUNCS
 AC_TYPE_OFF_T
 
 # Fancy caching of perror result...
@@ -1568,6 +1567,7 @@ V5_AC_OUTPUT_MAKEFILE(.
 	plugins/kdb/db2/libdb2/test
 	plugins/kdb/test
 	plugins/kdcpolicy/test
+	plugins/kdcpolicy/xrealmauthz
 	plugins/preauth/otp
 	plugins/preauth/spake
 	plugins/preauth/test

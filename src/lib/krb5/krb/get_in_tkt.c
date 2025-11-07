@@ -1307,7 +1307,7 @@ init_creds_step_request(krb5_context context,
             krb5_clear_error_message(context);
             code = 0;
         }
-    } if (ctx->more_padata != NULL) {
+    } else if (ctx->more_padata != NULL) {
         /* Continuing after KDC_ERR_MORE_PREAUTH_DATA_REQUIRED. */
         TRACE_INIT_CREDS_PREAUTH_MORE(context, ctx->selected_preauth_type);
         code = k5_preauth(context, ctx, ctx->more_padata, TRUE,
@@ -1330,9 +1330,6 @@ init_creds_step_request(krb5_context context,
     }
     /* Don't continue after a keyboard interrupt. */
     if (code == KRB5_LIBOS_PWDINTR)
-        goto cleanup;
-    /* Don't continue if fallback is disabled. */
-    if (code && ctx->fallback_disabled)
         goto cleanup;
     if (code) {
         /* See if we can try a different preauth mech before giving up. */

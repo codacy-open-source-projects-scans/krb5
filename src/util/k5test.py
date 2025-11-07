@@ -392,6 +392,7 @@ command-line flags.  These are documented in the --help output.
 
 import atexit
 import fcntl
+import glob
 import optparse
 import os
 import shlex
@@ -564,12 +565,37 @@ def _find_srctop():
     return os.path.abspath(root)
 
 
+# Look for the system LLVM symbolizer, matching the logic the asan
+# runtime would use as closely as possible.
+def _find_symbolizer():
+    if sys.platform == 'darwin':
+        f = which('atos')
+        if f is not None:
+            return f
+
+    f = which('llvm-symbolizer')
+    if f is not None:
+        return f
+
+    # Debian-derived systems have versioned symbolizer names.  If any
+    # exist, pick one of them.
+    l = glob.glob('/usr/bin/llvm-symbolizer-*')
+    if l:
+        return l[0]
+
+    f = which('addr2line')
+    if f is not None:
+        return f
+
+    return None
+
+
 # Parse command line arguments, setting global option variables.  Also
 # sets the global variable args to the positional arguments, which may
 # be used by the test script.
 def _parse_args():
     global args, verbose, testpass, _debug, _debugger_command
-    global _stop_before, _stop_after, _shell_before, _shell_after
+    global _stop_before, _stop_after, _shell_before, _shell_after, _trace
     parser = optparse.OptionParser()
     parser.add_option('-v', '--verbose', action='store_true', dest='verbose',
                       default=False, help='Display verbose output')
@@ -587,6 +613,8 @@ def _parse_args():
                       help='Spawn shell before numbered command (or "all")')
     parser.add_option('--shell-after', dest='shella', metavar='NUM',
                       help='Spawn shell after numbered command (or "all")')
+    parser.add_option('--trace', dest='trace', metavar='NUM',
+                      help='Collect trace log for numbered command (or "all")')
     (options, args) = parser.parse_args()
     verbose = options.verbose
     testpass = options.testpass
@@ -595,6 +623,7 @@ def _parse_args():
     _stop_after = _parse_cmdnum('--stop-after', options.stopa)
     _shell_before = _parse_cmdnum('--shell-before', options.shellb)
     _shell_after = _parse_cmdnum('--shell-after', options.shella)
+    _trace = _parse_cmdnum('--trace', options.trace)
 
     if options.debugger is not None:
         _debugger_command = shlex.split(options.debugger)
@@ -642,6 +671,8 @@ def _build_env():
     # Make sure we don't get confused by translated messages
     # or localized times.
     env['LC_ALL'] = 'C'
+    # Enforce proper argument order in tests with GNU getopt.
+    env['POSIXLY_CORRECT'] = '1'
     return env
 
 
@@ -710,10 +741,11 @@ def _check_trace(trace, expected):
 def _run_cmd(args, env, input=None, expected_code=0, expected_msg=None,
              expected_trace=None, return_trace=False):
     global null_input, _cmd_index, _last_cmd, _last_cmd_output, _debug
-    global _stop_before, _stop_after, _shell_before, _shell_after
+    global _stop_before, _stop_after, _shell_before, _shell_after, _trace
 
     tracefile = None
-    if expected_trace is not None or return_trace:
+    if (expected_trace is not None or return_trace or
+        _match_cmdnum(_trace, _cmd_index)):
         tracefile = 'testtrace'
         if os.path.exists(tracefile):
             os.remove(tracefile)
@@ -746,20 +778,24 @@ def _run_cmd(args, env, input=None, expected_code=0, expected_msg=None,
     _stop_or_shell(_stop_after, _shell_after, env, _cmd_index)
     _cmd_index += 1
 
-    # Check the return code and return the output.
-    if code != expected_code:
-        fail('%s failed with code %d.' % (args[0], code))
-
-    if expected_msg is not None and expected_msg not in outdata:
-        fail('Expected string not found in command output: ' + expected_msg)
-
+    # Copy trace output into the log if we collected it.
     if tracefile is not None:
         with open(tracefile, 'r') as f:
             trace = f.read()
         output('*** Trace output for previous command:\n')
         output(trace)
-        if expected_trace is not None:
-            _check_trace(trace, expected_trace)
+
+    # Check the return code.
+    if code != expected_code:
+        fail('%s failed with code %d.' % (args[0], code))
+
+    # Check for the expected message if given.
+    if expected_msg is not None and expected_msg not in outdata:
+        fail('Expected string not found in command output: ' + expected_msg)
+
+    # Check for expected trace log messages if given.
+    if expected_trace is not None:
+        _check_trace(trace, expected_trace)
 
     return (outdata, trace) if return_trace else outdata
 
@@ -787,7 +823,7 @@ def _debug_cmd(args, env, input):
 # Clean up the daemon process on exit.
 def _start_daemon(args, env, sentinel):
     global null_input, _cmd_index, _last_cmd, _last_cmd_output, _debug
-    global _stop_before, _stop_after, _shell_before, _shell_after
+    global _stop_before, _stop_after, _shell_before, _shell_after, _trace
 
     if (_match_cmdnum(_debug, _cmd_index)):
         output('*** [%d] Warning: ' % _cmd_index, True)
@@ -795,6 +831,14 @@ def _start_daemon(args, env, sentinel):
         _debug_cmd(args, env, None)
         output('*** Exiting after debugging daemon\n', True)
         sys.exit(1)
+
+    if (_match_cmdnum(_trace, _cmd_index)):
+        tracefile = 'testtrace.' + str(_cmd_index)
+        output('*** [%d] trace log in %s\n' % (_cmd_index, tracefile), True)
+        if os.path.exists(tracefile):
+            os.remove(tracefile)
+        env = env.copy()
+        env['KRB5_TRACE'] = tracefile
 
     args = _valgrind(args)
     _last_cmd = _shell_equiv(args)
@@ -952,6 +996,7 @@ class K5Realm(object):
         if get_creds and create_kdb and create_user and start_kdc:
             self.kinit(self.user_princ, password('user'))
             self.klist(self.user_princ)
+        self._setup_symbolizer()
 
     def _create_empty_dir(self):
         dir = self.testdir
@@ -1037,6 +1082,30 @@ class K5Realm(object):
         env['KPROP_PORT'] = str(self.kprop_port())
         env['GSS_MECH_CONFIG'] = self.gss_mech_config
         return env
+
+    # The krb5 libraries may be included in the dependency chain of
+    # llvm-symbolizer, which is invoked by asan when displaying stack
+    # traces.  If they are, asan-compiled krb5 libraries in
+    # LD_LIBRARY_PATH (or similar) will cause a dynamic linker error
+    # for the symbolizer at startup.  Work around this problem by
+    # wrapping the symbolizer in a script that unsets the dynamic
+    # linker variables before calling the real symbolizer.
+    def _setup_symbolizer(self):
+        if runenv.asan != 'yes':
+            return
+        if 'ASAN_SYMBOLIZER_PATH' in self.env:
+            return
+        symbolizer_path = _find_symbolizer()
+        if symbolizer_path is None:
+            return
+        wrapper_path = os.path.join(self.testdir, 'llvm-symbolizer')
+        with open(wrapper_path, 'w') as f:
+            f.write('#!/bin/sh\n')
+            for v in runenv.env:
+                f.write('unset %s\n' % v)
+            f.write('exec %s "$@"\n' % symbolizer_path)
+        os.chmod(wrapper_path, 0o755)
+        self.env['ASAN_SYMBOLIZER_PATH'] = wrapper_path
 
     def run(self, args, env=None, **keywords):
         if env is None:
