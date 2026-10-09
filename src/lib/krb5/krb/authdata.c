@@ -314,30 +314,24 @@ k5_ad_internalize(krb5_context kcontext,
                   size_t *lenremain)
 {
     krb5_error_code code = 0;
-    krb5_int32 i, count;
     krb5_octet *bp;
-    size_t remain;
+    size_t remain, count, i;
 
     bp = *buffer;
     remain = *lenremain;
 
-    code = krb5_ser_unpack_int32(&count, &bp, &remain);
+    code = k5_ser_unpack_len(&count, &bp, &remain);
     if (code != 0)
         return code;
 
     for (i = 0; i < count; i++) {
         struct _krb5_authdata_context_module *module;
-        krb5_int32 namelen;
+        size_t namelen;
         krb5_data name;
 
-        code = krb5_ser_unpack_int32(&namelen, &bp, &remain);
+        code = k5_ser_unpack_len(&namelen, &bp, &remain);
         if (code != 0)
             break;
-
-        if (remain < (size_t)namelen) {
-            code = ENOMEM;
-            break;
-        }
 
         name.length = namelen;
         name.data = (char *)bp;

@@ -935,6 +935,8 @@ krb5_ktfileint_internal_read_entry(krb5_context context, krb5_keytab id, krb5_ke
     }
 
     start_pos = ftell(KTFILEP(id));
+    if (size > INT32_MAX - start_pos)
+        return KRB5_KT_FORMAT;
 
     /* deal with guts of parsing... */
 
@@ -948,7 +950,7 @@ krb5_ktfileint_internal_read_entry(krb5_context context, krb5_keytab id, krb5_ke
     }
     if (!count || (count < 0))
         return KRB5_KT_END;
-    ret_entry->principal = (krb5_principal)malloc(sizeof(krb5_principal_data));
+    ret_entry->principal = k5alloc(sizeof(*ret_entry->principal), &error);
     if (!ret_entry->principal)
         return ENOMEM;
 
@@ -1105,13 +1107,9 @@ krb5_ktfileint_internal_read_entry(krb5_context context, krb5_keytab id, krb5_ke
 
     return 0;
 fail:
-
-    for (i = 0; i < ret_entry->principal->length; i++)
-        free(ret_entry->principal->data[i].data);
-    free(ret_entry->principal->data);
-    ret_entry->principal->data = 0;
-    free(ret_entry->principal);
-    ret_entry->principal = 0;
+    krb5_free_principal(context, ret_entry->principal);
+    free(ret_entry->key.contents);
+    memset(ret_entry, 0, sizeof(*ret_entry));
     return error;
 }
 
